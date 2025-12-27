@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    https://pstream.mov/
-// @version      1.0.1
+// @version      1.0.2
 // @description  Userscript replacement for the P-Stream extension
 // @author       Duplicake, P-Stream Team
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
@@ -44,7 +44,9 @@
   ];
 
   const STREAM_RULES = new Map();
-  const MEDIA_BLOBS = new Map();
+  const MEDIA_BLOBS = new Map(); // blobUrl -> { element, originalUrl, createdAt }
+  const ELEMENT_BLOBS = new WeakMap(); // element -> blobUrl
+  const ELEMENT_PENDING_REQUESTS = new WeakMap(); // element -> Set of pending request URLs
   const PROXY_CACHE = new Map();
   let fetchPatched = false;
   let xhrPatched = false;
@@ -203,12 +205,51 @@
   };
 
   // --- Media helpers -----------------------------------------------------
-  const makeBlobUrl = (data, contentType) => {
+  const makeBlobUrl = (data, contentType, originalUrl, element) => {
+    const dataSize = data instanceof ArrayBuffer ? data.byteLength : (data.length || 0);
     const blob = new Blob([data], { type: contentType || 'application/octet-stream' });
-    return URL.createObjectURL(blob);
+    const blobUrl = URL.createObjectURL(blob);
+    // Store metadata about the blob URL
+    MEDIA_BLOBS.set(blobUrl, {
+      element: element || null,
+      originalUrl: originalUrl || '',
+      createdAt: Date.now(),
+      size: dataSize,
+    });
+    // Track blob URL per element if element is provided
+    if (element) {
+      ELEMENT_BLOBS.set(element, blobUrl);
+    }
+    return blobUrl;
   };
 
-  const proxyMediaIfNeeded = async (url) => {
+  const cleanupElementBlob = (element) => {
+    const blobUrl = ELEMENT_BLOBS.get(element);
+    if (blobUrl) {
+      const blobMetadata = MEDIA_BLOBS.get(blobUrl);
+      try {
+        URL.revokeObjectURL(blobUrl);
+        MEDIA_BLOBS.delete(blobUrl);
+        ELEMENT_BLOBS.delete(element);
+        log('Cleaned up blob URL for element:', blobUrl);
+      } catch (err) {
+        log('Failed to revoke blob URL for element', err);
+      }
+    }
+    
+    // Cancel any pending requests for this element
+    const pendingRequests = ELEMENT_PENDING_REQUESTS.get(element);
+    if (pendingRequests && pendingRequests.size > 0) {
+      const cancelledCount = pendingRequests.size;
+      pendingRequests.forEach((url) => {
+        PROXY_CACHE.delete(url);
+      });
+      pendingRequests.clear();
+      log('Cancelled pending requests for element');
+    }
+  };
+
+  const proxyMediaIfNeeded = async (url, element = null) => {
     const normalized = normalizeUrl(url);
     if (!normalized) return null;
     
@@ -219,6 +260,17 @@
     
     const rule = findRuleForUrl(normalized);
     if (!rule) return null;
+    
+    // Track this request for the element so we can cancel it if src changes
+    if (element) {
+      if (!ELEMENT_PENDING_REQUESTS.has(element)) {
+        ELEMENT_PENDING_REQUESTS.set(element, new Set());
+      }
+      ELEMENT_PENDING_REQUESTS.get(element).add(normalized);
+    }
+    
+    // Store the expected src value to check if it changed during download
+    const expectedSrc = element ? (element.src || element.getAttribute('src')) : null;
     
     // Create promise and cache it immediately to prevent duplicate requests
     const proxyPromise = (async () => {
@@ -231,6 +283,38 @@
           responseType: 'arraybuffer',
           withCredentials: includeCredentials,
         });
+        
+        // Check if element's src has changed during download - if so, cancel this blob creation
+        if (element) {
+          const currentSrc = element.src || element.getAttribute('src');
+          if (currentSrc !== expectedSrc && currentSrc !== normalized) {
+            log('Source changed during download, cancelling blob creation for:', normalized);
+            // CRITICAL: Try to clear the response data from memory
+            // Note: GM API responses may be read-only, but we try anyway
+            try {
+              if (response.response instanceof ArrayBuffer) {
+                // Transfer the ArrayBuffer to a new empty one to release memory
+                // This doesn't actually clear it, but helps GC understand it's no longer needed
+                const emptyBuffer = new ArrayBuffer(0);
+                // The old buffer will be GC'd when there are no more references
+              }
+              if (response.responseText) {
+                response.responseText = '';
+              }
+            } catch (e) {
+              // Response may be read-only, that's okay
+            }
+            // Remove from cache immediately to prevent reuse
+            PROXY_CACHE.delete(normalized);
+            // Remove from pending requests
+            const pendingRequests = ELEMENT_PENDING_REQUESTS.get(element);
+            if (pendingRequests) {
+              pendingRequests.delete(normalized);
+            }
+            return null;
+          }
+        }
+        
         const headers = parseHeaders(response.responseHeaders);
         const contentType = headers['content-type'] || '';
 
@@ -243,18 +327,64 @@
         }
         if (contentType.includes('application/dash+xml') || normalized.includes('.mpd')) return null;
 
+        // Double-check element hasn't changed before creating blob
+        if (element) {
+          const currentSrc = element.src || element.getAttribute('src');
+          if (currentSrc !== expectedSrc && currentSrc !== normalized) {
+            log('Source changed right before blob creation, cancelling:', normalized);
+            // CRITICAL: Try to clear the response data from memory
+            try {
+              if (response.response instanceof ArrayBuffer) {
+                const emptyBuffer = new ArrayBuffer(0);
+              }
+              if (response.responseText) {
+                response.responseText = '';
+              }
+            } catch (e) {
+              // Response may be read-only, that's okay
+            }
+            // Remove from cache immediately to prevent reuse
+            PROXY_CACHE.delete(normalized);
+            const pendingRequests = ELEMENT_PENDING_REQUESTS.get(element);
+            if (pendingRequests) {
+              pendingRequests.delete(normalized);
+            }
+            return null;
+          }
+        }
+
         const blobUrl = makeBlobUrl(
           response.response instanceof ArrayBuffer ? response.response : new TextEncoder().encode(response.responseText ?? ''),
           contentType,
+          normalized,
+          element,
         );
-        MEDIA_BLOBS.set(blobUrl, true);
+        
+        // Remove from pending requests on success
+        if (element) {
+          const pendingRequests = ELEMENT_PENDING_REQUESTS.get(element);
+          if (pendingRequests) {
+            pendingRequests.delete(normalized);
+          }
+        }
+        
         return blobUrl;
       } catch (err) {
         log('Media proxy failed, falling back to original src', err);
+        // Remove from pending requests on error
+        if (element) {
+          const pendingRequests = ELEMENT_PENDING_REQUESTS.get(element);
+          if (pendingRequests) {
+            pendingRequests.delete(normalized);
+          }
+        }
         return null;
       } finally {
         // Remove from cache after a short delay
-        setTimeout(() => PROXY_CACHE.delete(normalized), 1000);
+        // Also clear any response data that might still be in the cached promise
+        setTimeout(() => {
+          PROXY_CACHE.delete(normalized);
+        }, 1000);
       }
     })();
     
@@ -585,13 +715,38 @@
       Object.defineProperty(win.HTMLMediaElement.prototype, 'src', {
         ...srcDescriptor,
         set(value) {
+          // Clean up previous blob URL and cancel pending requests before setting new src
+          cleanupElementBlob(this);
+          
+          // Track blob URLs that are set directly (not created by us, e.g., from HLS.js)
+          if (typeof value === 'string' && value.startsWith('blob:') && !MEDIA_BLOBS.has(value)) {
+            // Track this blob URL even though we didn't create it
+            MEDIA_BLOBS.set(value, {
+              element: this,
+              originalUrl: 'external',
+              createdAt: Date.now(),
+              size: 0, // Unknown size
+            });
+            ELEMENT_BLOBS.set(this, value);
+          }
+          
           if (typeof value === 'string') {
+            // Store the expected value to check later
+            const expectedValue = value;
             // Start proxying in background but set original URL immediately
-            proxyMediaIfNeeded(value).then(proxied => {
-              if (proxied && this.src === value) {
-                // Only update if src hasn't changed
+            proxyMediaIfNeeded(value, this).then(proxied => {
+              // Only update if src hasn't changed and we got a proxied URL
+              if (proxied && this.src === expectedValue) {
                 srcDescriptor.set.call(this, proxied);
+              } else if (!proxied && this.src === expectedValue) {
+                // If proxying failed or was cancelled, ensure original URL is still set
+                // (it should be, but double-check)
+                if (this.src !== expectedValue) {
+                  srcDescriptor.set.call(this, expectedValue);
+                }
               }
+            }).catch((err) => {
+              log('Error proxying media, using original URL', err);
             });
             return srcDescriptor.set.call(this, value);
           }
@@ -604,19 +759,115 @@
     const originalMediaSetAttribute = win.HTMLMediaElement.prototype.setAttribute;
     win.HTMLMediaElement.prototype.setAttribute = function (name, value) {
       if (typeof name === 'string' && name.toLowerCase() === 'src' && typeof value === 'string') {
+        // Clean up previous blob URL and cancel pending requests before setting new src
+        cleanupElementBlob(this);
+        
+        // Store the expected value to check later
+        const expectedValue = value;
         // Start proxying in background but set attribute immediately
-        proxyMediaIfNeeded(value).then(proxied => {
-          if (proxied && this.getAttribute('src') === value) {
-            // Only update if src attribute hasn't changed
+        proxyMediaIfNeeded(value, this).then(proxied => {
+          // Only update if src attribute hasn't changed and we got a proxied URL
+          if (proxied && this.getAttribute('src') === expectedValue) {
             originalMediaSetAttribute.call(this, name, proxied);
+          } else if (!proxied && this.getAttribute('src') === expectedValue) {
+            // If proxying failed or was cancelled, ensure original URL is still set
+            // (it should be, but double-check)
+            if (this.getAttribute('src') !== expectedValue) {
+              originalMediaSetAttribute.call(this, name, expectedValue);
+            }
           }
+        }).catch((err) => {
+          log('Error proxying media, using original URL', err);
         });
       }
       return originalMediaSetAttribute.call(this, name, value);
     };
 
+    // Track previous src values to detect changes
+    const previousSrcMap = new WeakMap();
+
+    // Clean up blob URLs when media elements are removed from DOM or src changes
+    const setupMutationObserver = () => {
+      const target = win.document.body || win.document.documentElement;
+      if (!target) {
+        // If body doesn't exist yet, try again later
+        setTimeout(setupMutationObserver, 100);
+        return;
+      }
+
+      const observer = new MutationObserver((mutations) => {
+        mutations.forEach((mutation) => {
+          // Handle removed nodes
+          mutation.removedNodes.forEach((node) => {
+            if (node.nodeType === 1) { // Element node
+              // Check if it's a media element
+              if (node instanceof win.HTMLMediaElement) {
+                cleanupElementBlob(node);
+                previousSrcMap.delete(node);
+              }
+              // Check for media elements within removed subtree
+              const mediaElements = node.querySelectorAll?.('video, audio');
+              if (mediaElements) {
+                mediaElements.forEach((el) => {
+                  cleanupElementBlob(el);
+                  previousSrcMap.delete(el);
+                });
+              }
+            }
+          });
+
+          // Handle attribute changes (especially src changes)
+          if (mutation.type === 'attributes' && mutation.attributeName === 'src') {
+            const target = mutation.target;
+            if (target instanceof win.HTMLMediaElement) {
+              const previousSrc = previousSrcMap.get(target);
+              const currentSrc = target.src || target.getAttribute('src');
+              
+              // If src changed and we had a previous blob URL, clean it up
+              if (previousSrc && previousSrc !== currentSrc && previousSrc.startsWith('blob:')) {
+                // Check if this blob URL is still tracked
+                const blobMetadata = MEDIA_BLOBS.get(previousSrc);
+                if (blobMetadata && blobMetadata.element === target) {
+                  cleanupElementBlob(target);
+                }
+              }
+              
+              previousSrcMap.set(target, currentSrc);
+            }
+          }
+        });
+      });
+
+      // Observe the entire document for removed nodes and attribute changes
+      observer.observe(target, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['src'],
+      });
+    };
+
+    // Setup observer when DOM is ready
+    if (win.document.readyState === 'loading') {
+      win.document.addEventListener('DOMContentLoaded', setupMutationObserver);
+    } else {
+      setupMutationObserver();
+    }
+
+    // Periodic cleanup to catch any orphaned blob URLs
+    // Run every 5 seconds to clean up blobs that are no longer in use
+    setInterval(() => {
+      cleanupOldStreamData();
+    }, 5000);
+
     win.addEventListener('beforeunload', () => {
-      MEDIA_BLOBS.forEach((_, blobUrl) => URL.revokeObjectURL(blobUrl));
+      MEDIA_BLOBS.forEach((_, blobUrl) => {
+        try {
+          URL.revokeObjectURL(blobUrl);
+        } catch (err) {
+          log('Failed to revoke blob URL on unload', err);
+        }
+      });
       MEDIA_BLOBS.clear();
     });
   };
@@ -629,17 +880,54 @@
 
   // --- Cleanup helper ----------------------------------------------------
   const cleanupOldStreamData = () => {
-    // Clear old blob URLs
-    MEDIA_BLOBS.forEach((_, blobUrl) => {
-      try {
-        URL.revokeObjectURL(blobUrl);
-      } catch (err) {
-        log('Failed to revoke blob URL', err);
+    const beforeBlobs = MEDIA_BLOBS.size;
+    const beforeCache = PROXY_CACHE.size;
+    let totalBlobSize = 0;
+    
+    // Get all currently active media elements and their blob URLs
+    const activeBlobUrls = new Set();
+    try {
+      const mediaElements = pageWindow.document.querySelectorAll('video, audio');
+      mediaElements.forEach((el) => {
+        const blobUrl = ELEMENT_BLOBS.get(el);
+        if (blobUrl) {
+          activeBlobUrls.add(blobUrl);
+        }
+        // Also check if element's src is a blob URL
+        if (el.src && el.src.startsWith('blob:')) {
+          activeBlobUrls.add(el.src);
+        }
+      });
+    } catch (err) {
+      log('Error checking active media elements', err);
+    }
+
+    // Calculate total size of blobs to be cleaned
+    MEDIA_BLOBS.forEach((metadata, blobUrl) => {
+      if (!activeBlobUrls.has(blobUrl)) {
+        totalBlobSize += metadata.size || 0;
       }
     });
-    MEDIA_BLOBS.clear();
+
+    // Revoke all blob URLs except those currently in use
+    let cleanedCount = 0;
+    MEDIA_BLOBS.forEach((metadata, blobUrl) => {
+      if (!activeBlobUrls.has(blobUrl)) {
+        try {
+          URL.revokeObjectURL(blobUrl);
+          MEDIA_BLOBS.delete(blobUrl);
+          cleanedCount++;
+        } catch (err) {
+          log('Failed to revoke blob URL', err);
+        }
+      }
+    });
+
+    // Clean up WeakMap entries for removed elements
+    // Note: WeakMap doesn't allow iteration, so we rely on the cleanup above
+
     PROXY_CACHE.clear();
-    log('Cleaned up old stream data');
+    log(`Cleaned up ${cleanedCount} unused blob URLs, ${MEDIA_BLOBS.size} remaining`);
   };
 
   // --- Message handlers --------------------------------------------------
@@ -700,6 +988,7 @@
     if (!reqBody) throw new Error('No request body found in the request.');
     
     // Clean up old stream data before preparing new stream
+    // This is called when a new source is scraped, so clean up unused blobs
     cleanupOldStreamData();
     
     const responseHeaders = Object.entries(reqBody.responseHeaders ?? {}).reduce((acc, [k, v]) => {
@@ -715,6 +1004,12 @@
     
     log('Stream prepared:', reqBody.ruleId);
     ensureAllProxies();
+    
+    // Schedule cleanup after a short delay to catch any old blobs
+    setTimeout(() => {
+      cleanupOldStreamData();
+    }, 500);
+    
     return { success: true };
   };
 
