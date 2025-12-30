@@ -1,5 +1,5 @@
 # Userscript
-Userscript replacement for the P-Stream extension
+Userscript alternative for the P-Stream extension. (90% compatability)
 
 1. Install a user script extension (e.g., Violentmonkey)
 2. [Download](https://raw.githubusercontent.com/p-stream/Userscript/main/p-stream.user.js) the script!
